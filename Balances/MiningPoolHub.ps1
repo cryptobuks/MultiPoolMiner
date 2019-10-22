@@ -1,58 +1,64 @@
 ﻿using module ..\Include.psm1
 
 param(
-    [Parameter(Mandatory = $true)]
-    [PSCustomObject]$Config
+    [String]$API_Key
 )
 
 $Name = Get-Item $MyInvocation.MyCommand.Path | Select-Object -ExpandProperty BaseName
-$PoolConfig = $Config.Pools.$Name
 
-if (-not $PoolConfig.API_Key) {
+if (-not $API_Key) {
     Write-Log -Level Verbose "Cannot get balance on pool ($Name) - no API key specified. "
     return
 }
 
 $RetryCount = 3
 $RetryDelay = 2
-while (-not ($APIRequest) -and $RetryCount -gt 0) {
+while (-not ($APIResponse) -and $RetryCount -gt 0) {
     try {
-        if (-not $APIRequest) {$APIRequest = Invoke-RestMethod "http://miningpoolhub.com/index.php?page=api&action=getuserallbalances&api_key=$($PoolConfig.API_Key)" -UseBasicParsing -TimeoutSec 3 -ErrorAction Stop}
+        if (-not $APIResponse) {$APIResponse = Invoke-RestMethod "http://miningpoolhub.com/index.php?page=api&action=getuserallbalances&api_key=$($API_Key)" -UseBasicParsing -TimeoutSec 3 -ErrorAction Stop}
     }
     catch {
         Start-Sleep -Seconds $RetryDelay # Pool might not like immediate requests
-        $RetryCount--        
     }
+    $RetryCount--
 }
 
-if (-not $APIRequest) {
+if (-not $APIResponse) {
     Write-Log -Level Warn "Pool Balance API ($Name) has failed. "
     return
 }
 
-if (($APIRequest.getuserallbalances.data | Get-Member -MemberType NoteProperty -ErrorAction Ignore | Measure-Object Name).Count -le 1) {
+if (($APIResponse.getuserallbalances.data | Get-Member -MemberType NoteProperty -ErrorAction Ignore | Measure-Object Name).Count -le 1) {
     Write-Log -Level Warn "Pool Balance API ($Name) returned nothing. "
     return
 }
 
-$APIRequest.getuserallbalances.data | Foreach-Object {
-
-    #Define currency
-    $Currency = $_.coin
-    try {
-        $Currency = Invoke-RestMethod "http://$($_.coin).miningpoolhub.com/index.php?page=api&action=getpoolinfo&api_key=$($PoolConfig.API_Key)" -UseBasicParsing -TimeoutSec 10 -ErrorAction Stop | Select-Object -ExpandProperty getpoolinfo | Select-Object -ExpandProperty data | Select-Object -ExpandProperty currency 
+$APIResponse.getuserallbalances.data | ForEach-Object {
+    $Currency = ""
+    $RetryCount = 3
+    $RetryDelay = 2
+    while (-not ($Currency) -and $RetryCount -gt 0) {
+        try {
+            $Currency = Invoke-RestMethod "http://$($_.coin).miningpoolhub.com/index.php?page=api&action=getpoolinfo&api_key=$($API_Key)" -UseBasicParsing -TimeoutSec 3 -ErrorAction Stop | Select-Object -ExpandProperty getpoolinfo | Select-Object -ExpandProperty data | Select-Object -ExpandProperty currency
+        }
+        catch {
+            Start-Sleep -Seconds $RetryDelay # Pool might not like immediate requests
+        }
+        $RetryCount--
     }
-    catch {
-        Write-Log -Level Warn "Cannot determine currency for coin ($CoinName) - cannot convert some balances to BTC or other currencies. "
+    
+    if (-not $Currency) {
+        Write-Log -Level Warn "Cannot determine balance for currency ($(if ($_.coin) {$_.coin} else {"unknown"})) - cannot convert some balances to BTC or other currencies. "
     }
-
-    [PSCustomObject]@{
+    else {
+        [PSCustomObject]@{
         Name        = "$($Name) ($($Currency))"
-        Pool        = $Name
-        Currency    = $Currency
-        Balance     = $_.confirmed
-        Pending     = $_.unconfirmed + $_.ae_confirmed + $_.ae_unconfirmed + $_.exchange
-        Total       = $_.confirmed + $_.unconfirmed + $_.ae_confirmed + $_.ae_unconfirmed + $_.exchange
-        Lastupdated = (Get-Date).ToUniversalTime()
+            Pool        = $Name
+            Currency    = $Currency
+            Balance     = $_.confirmed
+            Pending     = $_.unconfirmed + $_.ae_confirmed + $_.ae_unconfirmed + $_.exchange
+            Total       = $_.confirmed + $_.unconfirmed + $_.ae_confirmed + $_.ae_unconfirmed + $_.exchange
+            LastUpdated = (Get-Date).ToUniversalTime()
+        }
     }
 }

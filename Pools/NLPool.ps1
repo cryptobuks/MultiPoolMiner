@@ -1,82 +1,101 @@
-using module ..\Include.psm1
+﻿using module ..\Include.psm1
 
 param(
-    [alias("Wallet")]
-    [String]$BTC, 
-    [alias("WorkerName")]
-    [String]$Worker, 
-    [TimeSpan]$StatSpan
+    [TimeSpan]$StatSpan,
+    [PSCustomObject]$Config
 )
 
 $Name = Get-Item $MyInvocation.MyCommand.Path | Select-Object -ExpandProperty BaseName
 
-$RetryCount = 3
-$RetryDelay = 2
-while (-not ($NLPool_Request -and $NLPoolCoins_Request) -and $RetryCount -gt 0) {
-    try {
-        if (-not $NLPool_Request) {$NLPool_Request = Invoke-RestMethod "http://www.nlpool.nl/api/status" -UseBasicParsing -TimeoutSec 3 -ErrorAction Stop}
-        if (-not $NLPoolCoins_Request) {$NLPoolCoins_Request = Invoke-RestMethod "http://www.nlpool.nl/api/currencies" -UseBasicParsing -TimeoutSec 3 -ErrorAction Stop}
-    }
-    catch {
-        Start-Sleep -Seconds $RetryDelay # Pool might not like immediate requests
-        $RetryCount--        
-    }
-}
-
-if (-not $NLPool_Request) {
-    Write-Log -Level Warn "Pool API ($Name) has failed. "
-    return
-}
-
-if (($NLPool_Request | Get-Member -MemberType NoteProperty -ErrorAction Ignore | Measure-Object Name).Count -le 1) {
-    Write-Log -Level Warn "Pool API ($Name) returned nothing. "
-    return
-}
-
-$NLPool_Regions = "europe"
-$NLpool_Currencies = @("BTC", "LTC") + ($NLPoolCoins_Request | Get-Member -MemberType NoteProperty -ErrorAction Ignore | Select-Object -ExpandProperty Name) | Select-Object -Unique | Where-Object {Get-Variable $_ -ValueOnly -ErrorAction SilentlyContinue}
-
-if (-not $NLpool_Currencies) {
+# Guaranteed payout currencies
+$Payout_Currencies = @("BTC", "LTC") | Where-Object {$Config.Pools.$Name.Wallets.$_}
+if (-not $Payout_Currencies) {
     Write-Log -Level Verbose "Cannot mine on pool ($Name) - no wallet address specified. "
     return
 }
 
-$NLPool_Request | Get-Member -MemberType NoteProperty -ErrorAction Ignore | Select-Object -ExpandProperty Name | Where-Object {$NLPool_Request.$_.hashrate -gt 0} | ForEach-Object {
-    $NLPool_Host = "mine.nlpool.nl"
-    $NLPool_Port = $NLPool_Request.$_.port
-    $NLPool_Algorithm = $NLPool_Request.$_.name
-    $NLPool_Algorithm_Norm = Get-Algorithm $NLPool_Algorithm
-    $NLPool_Coin = ""
+$PoolRegions = "europe"
+$PoolAPIStatusUri = "https://www.nlpool.nl/api/status"
+$PoolAPICurrenciesUri = "https://www.nlpool.nl/api/currencies"
 
-    $Divisor = 1000000 * [Double]$NLPool_Request.$_.mbtc_mh_factor
-
-    switch ($NLPool_Algorithm_Norm) {
-        "Yescrypt" {$Divisor *= 100}       #temp fix
+$RetryCount = 3
+$RetryDelay = 2
+while (-not ($APIStatusResponse -and $APICurrenciesResponse) -and $RetryCount -gt 0) {
+    try {
+        if (-not $APIStatusResponse) {$APIStatusResponse = Invoke-RestMethod $PoolAPIStatusUri -UseBasicParsing -TimeoutSec 3 -ErrorAction Stop}
+        if (-not $APICurrenciesResponse) {$APICurrenciesResponse  = Invoke-RestMethod $PoolAPICurrenciesUri -UseBasicParsing -TimeoutSec 3 -ErrorAction Stop}
     }
+    catch {
+        Start-Sleep -Seconds $RetryDelay
+        $RetryCount--        
+    }
+}
 
-    if ((Get-Stat -Name "$($Name)_$($NLPool_Algorithm_Norm)_Profit") -eq $null) {$Stat = Set-Stat -Name "$($Name)_$($NLPool_Algorithm_Norm)_Profit" -Value ([Double]$NLPool_Request.$_.estimate_last24h / $Divisor) -Duration (New-TimeSpan -Days 1)}
-    else {$Stat = Set-Stat -Name "$($Name)_$($NLPool_Algorithm_Norm)_Profit" -Value ([Double]$NLPool_Request.$_.estimate_current / $Divisor) -Duration $StatSpan -ChangeDetection $true}
+if (-not ($APIStatusResponse -and $APICurrenciesResponse)) {
+    Write-Log -Level Warn "Pool API ($Name) has failed. "
+    return
+}
 
-    $NLPool_Regions | ForEach-Object {
-        $NLPool_Region = $_
-        $NLPool_Region_Norm = Get-Region $NLPool_Region
+if (($APIStatusResponse | Get-Member -MemberType NoteProperty -ErrorAction Ignore | Measure-Object Name).Count -lt 1) {
+    Write-Log -Level Warn "Pool API ($Name) [StatusUri] returned nothing. "
+    return
+}
 
-        $NLPool_Currencies | ForEach-Object {
+if (($APICurrenciesResponse | Get-Member -MemberType NoteProperty -ErrorAction Ignore | Measure-Object Name).Count -lt 1) {
+    Write-Log -Level Warn "Pool API ($Name) [CurrenciesUri] returned nothing. "
+    return
+}
+
+$Payout_Currencies = (@($Payout_Currencies) + @($APICurrenciesResponse | Get-Member -MemberType NoteProperty -ErrorAction Ignore | Select-Object -ExpandProperty Name)) | Where-Object {$Config.Pools.$Name.Wallets.$_} | Sort-Object -Unique
+if (-not $Payout_Currencies) {
+    Write-Log -Level Verbose "Cannot mine on pool ($Name) - no wallet address specified. "
+    return
+}
+
+$APIStatusResponse | Get-Member -MemberType NoteProperty -ErrorAction Ignore | Select-Object -ExpandProperty Name | Where-Object {$APIStatusResponse.$_.hashrate -GT 0} | ForEach-Object {
+
+    $PoolHost       = "mine.nlpool.nl"
+    $Port           = $APIStatusResponse.$_.port
+    $Algorithm      = $APIStatusResponse.$_.name
+    $CoinName       = Get-CoinName $(if ($APIStatusResponse.$_.coins -eq 1) {$APICurrenciesResponse.$($APICurrenciesResponse | Get-Member -MemberType NoteProperty -ErrorAction Ignore | Select-Object -ExpandProperty Name | Where-Object {$APICurrenciesResponse.$_.algo -eq $Algorithm}).Name})
+    $Algorithm_Norm = Get-AlgorithmFromCoinName $CoinName
+    if (-not $Algorithm_Norm) {$Algorithm_Norm = Get-Algorithm $Algorithm}
+    if ($Algorithm_Norm -match "Equihash1445|Equihash1927") {$CoinName = "ManagedByPool"}
+    $Workers        = $APIStatusResponse.$_.workers
+    $Fee            = $APIStatusResponse.$_.Fees / 100
+
+    $Divisor = 1000000 * [Double]$APIStatusResponse.$_.mbtc_mh_factor
+
+    if ((Get-Stat -Name "$($Name)_$($Algorithm_Norm)_Profit") -eq $null) {$Stat = Set-Stat -Name "$($Name)_$($Algorithm_Norm)_Profit" -Value ([Double]$APIStatusResponse.$_.estimate_last24h / $Divisor) -Duration (New-TimeSpan -Days 1)}
+    else {$Stat = Set-Stat -Name "$($Name)_$($Algorithm_Norm)_Profit" -Value ([Double]$APIStatusResponse.$_.estimate_current / $Divisor) -Duration $StatSpan -ChangeDetection $true}
+
+    try {
+        $EstimateCorrection = ($APIStatusResponse.$_.actual_last24h / 1000) / $APIStatusResponse.$_.estimate_last24h
+    }
+    catch {}
+
+    $PoolRegions | ForEach-Object {
+        $Region = $_
+        $Region_Norm = Get-Region $Region
+
+        $Payout_Currencies | ForEach-Object {
             [PSCustomObject]@{
-                Algorithm     = $NLPool_Algorithm_Norm
-                CoinName      = $NLPool_Coin
-                Price         = $Stat.Live
-                StablePrice   = $Stat.Week
-                MarginOfError = $Stat.Week_Fluctuation
-                Protocol      = "stratum+tcp"
-                Host          = "$NLPool_Host"
-                Port          = $NLPool_Port
-                User          = Get-Variable $_ -ValueOnly
-                Pass          = "$Worker,c=$_"
-                Region        = $NLPool_Region_Norm
-                SSL           = $false
-                Updated       = $Stat.Updated
-                PayoutScheme  = "PPLNS"
+                Algorithm          = $Algorithm_Norm
+                CoinName           = $CoinName
+                Price              = $Stat.Live
+                StablePrice        = $Stat.Week
+                MarginOfError      = $Stat.Week_Fluctuation
+                Protocol           = "stratum+tcp"
+                Host               = "$PoolHost"
+                Port               = $Port
+                User               = $Config.Pools.$Name.Wallets.$_
+                Pass               = "$($Config.Pools.$Name.Worker),c=$_"
+                Region             = $Region_Norm
+                SSL                = $false
+                Updated            = $Stat.Updated
+                Fee                = $Fee
+                Workers            = [Int]$Workers
+                EstimateCorrection = $EstimateCorrection
             }
         }
     }

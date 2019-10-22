@@ -1,46 +1,46 @@
 ﻿using module ..\Include.psm1
 
 param(
-    [Parameter(Mandatory = $true)]
-    [PSCustomObject]$Config
+    [PSCustomObject]$Wallets
 )
 
 $Name = Get-Item $MyInvocation.MyCommand.Path | Select-Object -ExpandProperty BaseName
-$PoolConfig = $Config.Pools.$Name
 
-if (-not $PoolConfig.BTC) {
+# Guaranteed payout currencies
+$Payout_Currencies = @("BTC") | Where-Object {$Wallets.$_}
+if (-not $Payout_Currencies) {
     Write-Log -Level Verbose "Cannot get balance on pool ($Name) - no wallet address specified. "
     return
 }
 
 $RetryCount = 3
 $RetryDelay = 2
-while (-not ($APIRequest) -and $RetryCount -gt 0) {
+while (-not ($APIResponse) -and $RetryCount -gt 0) {
     try {
-        if (-not $APIRequest) {$APIRequest = Invoke-RestMethod "http://pool.hashrefinery.com/api/wallet?address=$($PoolConfig.BTC)" -UseBasicParsing -TimeoutSec 3 -ErrorAction Stop}
+        $APIResponse = Invoke-RestMethod "http://pool.hashrefinery.com/api/wallet?address=$($Wallets.BTC)" -UseBasicParsing -TimeoutSec 3 -ErrorAction Stop
     }
     catch {
         Start-Sleep -Seconds $RetryDelay # Pool might not like immediate requests
-        $RetryCount--        
     }
+    $RetryCount--
 }
 
-if (-not $APIRequest) {
+if (-not $APIResponse) {
     Write-Log -Level Warn "Pool Balance API ($Name) has failed. "
     return
 }
 
-if (($APIRequest | Get-Member -MemberType NoteProperty -ErrorAction Ignore | Measure-Object Name).Count -le 1) {
+if (($APIResponse | Get-Member -MemberType NoteProperty -ErrorAction Ignore | Measure-Object Name).Count -le 1) {
     Write-Log -Level Warn "Pool Balance API ($Name) returned nothing. "
     return
 }
 
 [PSCustomObject]@{
-    Name        = "$($Name) ($($APIRequest.currency))"
+    Name        = "$($Name) ($($APIResponse.currency))"
     Pool        = $Name
-    Currency    = $APIRequest.currency
-    Balance     = $APIRequest.balance
-    Pending     = $APIRequest.unsold
-    Total       = $APIRequest.unpaid
-    Lastupdated = (Get-Date).ToUniversalTime()
+    Currency    = $APIResponse.currency
+    Balance     = $APIResponse.balance
+    Pending     = $APIResponse.unsold
+    Total       = $APIResponse.unpaid
+    LastUpdated = (Get-Date).ToUniversalTime()
 }

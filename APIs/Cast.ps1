@@ -5,36 +5,52 @@ class Cast : Miner {
         if ($this.GetStatus() -ne [MinerStatus]::Running) {return @()}
 
         $Server = "localhost"
-        $Timeout = 10 #seconds
+        $Timeout = 5 #seconds
 
-        $Request = ""
+        $Request = "http://$($Server):$($this.Port)/"
         $Response = ""
 
-        $HashRate = [PSCustomObject]@{}
-
         try {
-            $Response = Invoke-WebRequest "http://$($Server):$($this.Port)/" -UseBasicParsing -TimeoutSec $Timeout -ErrorAction Stop
+            if ($Global:PSVersionTable.PSVersion -ge [System.Version]("6.2.0")) {
+                $Response = Invoke-WebRequest $Request -TimeoutSec $Timeout -DisableKeepAlive -MaximumRetryCount 3 -RetryIntervalSec 1 -ErrorAction Stop
+            }
+            else {
+                $Response = Invoke-WebRequest $Request -UseBasicParsing -TimeoutSec $Timeout -DisableKeepAlive -ErrorAction Stop
+            }
             $Data = $Response | ConvertFrom-Json -ErrorAction Stop
         }
         catch {
-            if ((Get-Date) -gt ($this.Process.PSBeginTime.AddSeconds(30))) {Write-Log -Level Error "Failed to connect to miner ($($this.Name)) [ProcessId: $($this.ProcessId)]. "}
             return @($Request, $Response)
         }
 
-        $HashRate_Name = [String]$this.Algorithm[0]
-        $HashRate_Value = [Double]($Data.devices.hash_rate | Measure-Object -Sum).Sum / 1000
+        $HashRate = [PSCustomObject]@{}
+        $HashRate_Name = [String]($this.Algorithm | Select-Object -Index 0)
+        $Shares_Accepted = [Int]0
+        $Shares_Rejected = [Int]0
 
-        if ($HashRate_Name -and $HashRate_Value -GT 0) {$HashRate | Add-Member @{$HashRate_Name = [Int64]$HashRate_Value}}
-
-        if ($HashRate | Get-Member -MemberType NoteProperty -ErrorAction Ignore | Select-Object -ExpandProperty Name) {
-            $this.Data += [PSCustomObject]@{
-                Date     = (Get-Date).ToUniversalTime()
-                Raw      = $Response
-                HashRate = $HashRate
-                Device   = @()
+        if ($this.AllowedBadShareRatio) {
+            $Shares_Accepted = [Int64]$Data.shares.num_accepted
+            $Shares_Rejected = [Int64]($Data.shares.num_rejected + $Data.shares.num_rejected + $Data.shares.num_network_fail + $Data.shares.num_outdated)
+            if ((-not $Shares_Accepted -and $Shares_Rejected -ge 3) -or ($Shares_Accepted -and ($Shares_Rejected * $this.AllowedBadShareRatio -gt $Shares_Accepted))) {
+                $this.SetStatus("Failed")
+                $this.StatusMessage = " was stopped because of too many bad shares for algorithm $HashRate_Name (total: $($Shares_Accepted + $Shares_Rejected) / bad: $($Shares_Rejected) [Configured allowed ratio is 1:$(1 / $this.AllowedBadShareRatio)])"
+                return @($Request, $Data | ConvertTo-Json -Depth 10 -Compress)
             }
         }
 
-        return @($Request, $Data | ConvertTo-Json -Compress)
+        $HashRate | Add-Member @{$HashRate_Name = [Double]($Data.devices.hash_rate | Measure-Object -Sum).Sum / 1000}
+
+        if ($HashRate.PSObject.Properties.Value -gt 0) {
+            $this.Data += [PSCustomObject]@{
+                Date       = (Get-Date).ToUniversalTime()
+                Raw        = $Data
+                HashRate   = $HashRate
+                PowerUsage = (Get-PowerUsage $this.DeviceName)
+                Shares     = @($Shares_Accepted, $Shares_Rejected, $($Shares_Accepted + $Shares_Rejected))
+                Device     = @()
+            }
+        }
+
+        return @($Request, $Data | ConvertTo-Json -Depth 10 -Compress)
     }
 }
